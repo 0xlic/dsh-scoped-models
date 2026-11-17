@@ -1,5 +1,5 @@
 import z from '@deepseek-ai/schemastery';
-import { filterCatalog, modelKey, normalizeSettings, wrapCatalog } from './core.js';
+import { modelKey, normalizeSettings, scopeGroups, wrapCatalog, wrapReasoningDefaults } from './core.js';
 
 // Small transport-envelope check; application payload validation stays below.
 // No runtime dependency on a second copy of DSH's connection service.
@@ -10,10 +10,11 @@ const clientRequestSchema = {
   },
 };
 export const name = 'scoped-models';
-export const inject = ['sessionController', 'settings', 'connection', 'tools'];
+export const inject = ['sessionController', 'settings', 'connection', 'tools', 'llm'];
 export const Config = z.object({
-  enabled: z.boolean().default(false).extra('volatile', true),
+  enabled: z.boolean().default(true).extra('volatile', true),
   models: z.array(z.object({ provider: z.string().required(), model: z.string().required() })).default([]).extra('volatile', true),
+  reasoningDefaults: z.array(z.object({ provider: z.string().required(), model: z.string().required(), effort: z.string().required() })).default([]).extra('volatile', true),
 });
 
 export function apply(ctx, config) {
@@ -24,10 +25,14 @@ export function apply(ctx, config) {
   const readSettings = () => {
     const current = ctx.fiber.effectiveConfig ?? ctx.fiber.config ?? config;
     const get = key => typeof current[key]?.get === 'function' ? current[key].get() : current[key];
-    return { enabled: get('enabled') ?? false, models: get('models') ?? [] };
+    return normalizeSettings({ enabled: get('enabled') ?? true, models: get('models') ?? [], reasoningDefaults: get('reasoningDefaults') ?? [] });
   };
-  const notify = () => ctx.emit('llm/adapters-updated');
+  const notify = () => typeof ctx.llm.emitAdaptersUpdated === 'function' ? ctx.llm.emitAdaptersUpdated() : ctx.emit('llm/adapters-updated');
   let catalog;
+  ctx.effect(() => {
+    const dispose = wrapReasoningDefaults(ctx.llm, readSettings);
+    return () => { dispose(); notify(); };
+  });
   ctx.effect(() => {
     catalog = wrapCatalog(ctx.sessionController, readSettings);
     notify();
@@ -41,25 +46,36 @@ export function apply(ctx, config) {
       const settings = readSettings();
       const filtered = await catalog.current();
       const needle = query.toLowerCase().trim();
+      const groups = scopeGroups(full.groups);
+      const available = new Set(groups.flatMap(group => group.models.map(model => modelKey(group.id, model.id))));
       return {
         settings, revision: descriptor()?.revision,
-        groups: full.groups.map(group => ({ ...group, models: group.models.filter(model => !needle || `${group.id} ${group.name} ${model.id} ${model.name}`.toLowerCase().includes(needle)) })).filter(group => group.models.length),
+        groups: groups.map(group => ({ ...group, models: group.models.filter(model => !needle || `${group.id} ${group.name} ${model.id} ${model.name}`.toLowerCase().includes(needle)) })).filter(group => group.models.length),
         failures: full.failures,
-        total: full.groups.reduce((n, group) => n + group.models.length, 0),
+        total: groups.reduce((n, group) => n + group.models.length, 0),
         visible: filtered.groups.reduce((n, group) => n + group.models.length, 0),
-        missing: settings.models.filter(pair => !full.groups.some(group => group.id === pair.provider && group.models.some(model => model.id === pair.model))),
+        missing: settings.models.filter(pair => !available.has(modelKey(pair.provider, pair.model))),
       };
     },
     async update(input, expectedRevision) {
-      const next = normalizeSettings(input);
+      const validated = normalizeSettings(input);
       const task = pending.then(async () => {
+        const previousSettings = readSettings();
+        // Older clients may update only the filter; omitted defaults are preserved.
+        const next = { ...validated, reasoningDefaults: validated.reasoningDefaults ?? previousSettings.reasoningDefaults };
         const full = await catalog.full();
-        if (next.enabled && filterCatalog(full, next).groups.length === 0) throw new Error('None of the selected models is currently available; refresh the catalog or disable filtering');
         // Existing unavailable selections may survive sign-out; do not silently remove them.
         const previous = new Set(readSettings().models.map(pair => modelKey(pair.provider, pair.model)));
         const available = new Set(full.groups.flatMap(group => group.models.map(model => modelKey(group.id, model.id))));
         if (next.models.some(pair => !previous.has(modelKey(pair.provider, pair.model)) && !available.has(modelKey(pair.provider, pair.model)))) throw new Error('A newly selected model is unavailable; refresh the catalog');
+        const previousDefaults = new Map(previousSettings.reasoningDefaults.map(item => [modelKey(item.provider, item.model), item.effort]));
+        const capabilities = new Map(scopeGroups(full.groups).flatMap(group => group.models.map(model => [modelKey(group.id, model.id), model.reasoning?.efforts ?? []])));
+        for (const item of next.reasoningDefaults) {
+          const key = modelKey(item.provider, item.model);
+          if (!capabilities.get(key)?.some(effort => effort.id === item.effort) && previousDefaults.get(key) !== item.effort) throw new Error(`Unsupported default reasoning effort for ${item.provider} / ${item.model}; refresh the catalog`);
+        }
         await ctx.settings.update(ns, next, expectedRevision);
+        notify();
         return { settings: readSettings(), revision: descriptor()?.revision };
       });
       pending = task.catch(() => {});
@@ -93,13 +109,14 @@ export function apply(ctx, config) {
   }
   ctx.effect(() => ctx.tools.register({
     name: 'scoped_models',
-    description: 'List/search available models and manage which appear in native model pickers. Filtering does not change provider configuration or running sessions.',
+    description: 'List/search models, manage native picker scope and per-model default reasoning levels. Explicit session reasoning selections take priority; provider routes are unchanged.',
     parameters: {
       type: 'object', properties: {
         action: { type: 'string', enum: ['list', 'set'], description: 'list returns the scope and matching full-catalog models; set replaces the saved scope.' },
         query: { type: 'string', description: 'Case-insensitive name, provider, or model-ID search for list.' },
-        enabled: { type: 'boolean', description: 'For set: false restores the full native list; true requires at least one available selected model.' },
-        models: { type: 'array', description: 'For set: complete selected provider/model pairs, using IDs from list.', items: { type: 'object', properties: { provider: { type: 'string' }, model: { type: 'string' } }, required: ['provider', 'model'], additionalProperties: false } },
+        enabled: { type: 'boolean', description: 'For set: true shows only selected models (the default); an empty selection shows no models. false is a compatibility escape hatch that restores the full native list.' },
+        models: { type: 'array', description: 'For set: complete selected provider/model pairs, using IDs from list. The codex scope applies to all codex-* accounts.', items: { type: 'object', properties: { provider: { type: 'string' }, model: { type: 'string' } }, required: ['provider', 'model'], additionalProperties: false } },
+        reasoningDefaults: { type: 'array', description: 'For set: replace per-model defaults using supported effort IDs from list. Omit to preserve, [] to reset. Applies even when filtering is off; codex is shared by codex-* accounts.', items: { type: 'object', properties: { provider: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' } }, required: ['provider', 'model', 'effort'], additionalProperties: false } },
         revision: { type: 'number', description: 'For set: revision from list to refuse a stale edit.' },
       }, required: ['action'], additionalProperties: false,
     },
@@ -108,10 +125,10 @@ export function apply(ctx, config) {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     async execute(args) {
-      if (args.action === 'set') return operations.update({ enabled: args.enabled, models: args.models }, args.revision);
+      if (args.action === 'set') return operations.update({ enabled: args.enabled, models: args.models, ...(args.reasoningDefaults === undefined ? {} : { reasoningDefaults: args.reasoningDefaults }) }, args.revision);
       if (args.action !== 'list') throw new Error('Unknown action');
       const result = await operations.read(args.query ?? '');
-      const models = result.groups.flatMap(group => group.models.map(model => ({ provider: group.id, model: model.id, name: model.name })));
+      const models = result.groups.flatMap(group => group.models.map(model => ({ provider: group.id, model: model.id, name: model.name, ...(model.reasoning ? { reasoning: model.reasoning } : {}) })));
       const { groups, ...summary } = result;
       return { ...summary, models: models.slice(0, 100), matched: models.length, truncated: models.length > 100 };
     },

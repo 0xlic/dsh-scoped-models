@@ -2,5 +2,6 @@
     - id: scoped-models
       name: dsh-scoped-models
       config:
-        enabled: false
+        enabled: true
         models: []
+        reasoningDefaults: []
